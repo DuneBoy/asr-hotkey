@@ -4,9 +4,12 @@ After=sound.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/uv run python3 %h/.local/share/parakeet/parakeet_dbus.py
+ExecStart=/usr/bin/uv run python3 -u %h/.local/share/parakeet/parakeet_dbus.py
 WorkingDirectory=%h/.local/share/parakeet
 Environment="YDOTOOL_SOCKET=/run/ydotool/socket"
+Environment="WAYLAND_DISPLAY=wayland-1"
+Environment="XDG_RUNTIME_DIR=/run/user/%U"
+Environment="DISPLAY=:1"
 Restart=always
 RestartSec=5
 StandardOutput=journal

@@ -9,6 +9,7 @@ A simple push-to-talk speech-to-text system for Linux/Wayland using the multi-la
 - Multilanguage - you can even switch language while speaking.
 - Everything runs local, forever forever
 - Model is kept in memory for fast response
+- System tray icon shows status (gray=idle, red=recording, blue=transcribing)
 - Use any model from the model that onnx-asr supports by changing the model name the python file.
 - All credits go to the onnx-asr project and NVIDIA, thanks for making local ASR so great!
 
