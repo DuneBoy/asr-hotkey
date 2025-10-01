@@ -302,8 +302,8 @@ class ParakeetService:
             # Copy to clipboard and paste
             if result and result.strip():
                 try:
-                    # Copy to clipboard (Wayland)
-                    subprocess.run(['wl-copy'], input=result.encode(), check=True)
+                    # Copy to clipboard (Wayland) with trailing space
+                    subprocess.run(['wl-copy'], input=(result + ' ').encode(), check=True)
 
                     # Paste using ydotool
                     subprocess.run(['ydotool', 'key', '29:1', '42:1', '47:1', '47:0', '42:0', '29:0'], check=True)
