@@ -1,4 +1,4 @@
-# Parakeet Speech-to-Text - Background Service 
+# Speech-to-Text - Background Service for Linux/Wayland
 
 A simple push-to-talk speech-to-text system for Linux/Wayland using the multi-language [parakeet ASR model](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) from NVIDIA and the [onnx-asr](https://github.com/istupakov/onnx-asr) library. 
 
