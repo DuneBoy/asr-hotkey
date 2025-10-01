@@ -1,0 +1,16 @@
+[Unit]
+Description=Parakeet Speech-to-Text D-Bus Service
+After=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/uv run python3 %h/.local/share/parakeet/parakeet_dbus.py
+WorkingDirectory=%h/.local/share/parakeet
+Environment="YDOTOOL_SOCKET=/run/ydotool/socket"
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=ydotoold - Generic Linux command line automation tool
+Documentation=https://github.com/ReimuNotMoe/ydotool
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /run/ydotool
+ExecStartPre=/bin/chmod 777 /run/ydotool
+ExecStart=/usr/bin/ydotoold --socket-path=/run/ydotool/socket --socket-perm=0666
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
