@@ -98,6 +98,9 @@ class ParakeetService:
             <method name='StartRecordingTransform'/>
             <method name='StopRecordingTransform'/>
             <method name='ToggleTransform'/>
+            <method name='StartRecordingAsk'/>
+            <method name='StopRecordingAsk'/>
+            <method name='ToggleAsk'/>
         </interface>
     </node>
     """
@@ -121,6 +124,7 @@ class ParakeetService:
         self.tray_icon = None
         self.use_llm = False  # Track whether to use LLM processing (insert mode)
         self.use_transform = False  # Track whether to use LLM transform mode
+        self.use_ask = False  # Track whether to use LLM ask mode (direct questions)
 
         with suppress_stderr():
             self.p = pyaudio.PyAudio()
@@ -259,6 +263,8 @@ class ParakeetService:
             return
 
         print("Starting recording...")
+        # If called directly (not from LLM/Transform/Ask), reset all LLM modes
+        # The specific Start methods set their flags BEFORE calling this
         self.is_recording = True
         self._update_tray_icon("recording")
 
@@ -326,8 +332,18 @@ class ParakeetService:
                 print("⏳ Processing remaining chunks...")
                 self.transcription_thread.join(timeout=30.0)
 
-            # Get final merged result
-            self._finalize_transcription()
+            # Capture the current mode flags before finalizing
+            use_llm = self.use_llm
+            use_transform = self.use_transform
+            use_ask = self.use_ask
+
+            # Reset flags immediately so next recording can set them
+            self.use_llm = False
+            self.use_transform = False
+            self.use_ask = False
+
+            # Get final merged result with captured flags
+            self._finalize_transcription(use_llm, use_transform, use_ask)
         else:
             # Standard mode
             if self.stream:
@@ -347,8 +363,18 @@ class ParakeetService:
             # Copy audio frames before threading
             audio_data = b''.join(self.audio_frames)
 
-            # Run transcription in a separate thread
-            transcribe_thread = threading.Thread(target=self._transcribe, args=(audio_data,), daemon=True)
+            # Capture the current mode flags before starting thread
+            use_llm = self.use_llm
+            use_transform = self.use_transform
+            use_ask = self.use_ask
+
+            # Reset flags immediately so next recording can set them
+            self.use_llm = False
+            self.use_transform = False
+            self.use_ask = False
+
+            # Run transcription in a separate thread with captured flags
+            transcribe_thread = threading.Thread(target=self._transcribe, args=(audio_data, use_llm, use_transform, use_ask), daemon=True)
             transcribe_thread.start()
 
     def _streaming_transcription_loop(self):
@@ -406,8 +432,14 @@ class ParakeetService:
             print(f"Error transcribing chunk {chunk_id}: {e}")
             return None
 
-    def _finalize_transcription(self):
-        """Finalize and output the complete transcription."""
+    def _finalize_transcription(self, use_llm=False, use_transform=False, use_ask=False):
+        """Finalize and output the complete transcription.
+
+        Args:
+            use_llm: Whether to use LLM insert mode
+            use_transform: Whether to use LLM transform mode
+            use_ask: Whether to use LLM ask mode
+        """
         # Update to transcribing state
         self._update_tray_icon("transcribing")
 
@@ -425,16 +457,23 @@ class ParakeetService:
         print(final_text)
         print(f"{'=' * 60}\n")
 
-        # Process with LLM if enabled
-        print(f"DEBUG: use_llm flag is: {self.use_llm}, use_transform flag is: {self.use_transform}")
-        if self.use_transform:
+        # Process with LLM if enabled (using captured flags)
+        print(f"DEBUG: use_llm={use_llm}, use_transform={use_transform}, use_ask={use_ask}")
+        if use_ask:
+            final_text = self._ask_llm(final_text)
+            print(f"\n{'=' * 60}")
+            print(f"📝 After LLM Ask:")
+            print(f"{'=' * 60}")
+            print(final_text)
+            print(f"{'=' * 60}\n")
+        elif use_transform:
             final_text = self._transform_with_llm(final_text)
             print(f"\n{'=' * 60}")
             print(f"📝 After LLM Transform:")
             print(f"{'=' * 60}")
             print(final_text)
             print(f"{'=' * 60}\n")
-        elif self.use_llm:
+        elif use_llm:
             final_text = self._process_with_llm(final_text)
             print(f"\n{'=' * 60}")
             print(f"📝 After LLM Processing:")
@@ -442,7 +481,7 @@ class ParakeetService:
             print(final_text)
             print(f"{'=' * 60}\n")
         else:
-            print("DEBUG: Skipping LLM processing (both flags are False)")
+            print("DEBUG: Skipping LLM processing (all flags are False)")
 
         # Copy to clipboard and paste (same as standard mode)
         try:
@@ -456,10 +495,92 @@ class ParakeetService:
         except Exception as e:
             print(f"Could not paste result: {e}. Result: {final_text}")
 
-        # Reset LLM flags and return to idle state
-        self.use_llm = False
-        self.use_transform = False
+        # Return to idle state
+        # Note: flags are already reset before calling this function
         self._update_tray_icon("idle")
+
+    def _ask_llm(self, question):
+        """Ask the LLM a direct question and get a concise answer.
+
+        Args:
+            question: The question/instruction to ask
+
+        Returns:
+            The answer from the LLM, or the original question if processing fails
+        """
+        try:
+            print("\n" + "="*60)
+            print("💭 LLM ASK MODE DEBUG")
+            print("="*60)
+
+            # Get API key
+            print("\n🔑 Checking API key...")
+            api_key = os.environ.get('OPENROUTER_API_KEY', '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')
+            if not api_key:
+                print("❌ OPENROUTER_API_KEY not set, returning question as-is")
+                return question
+            print(f"   API key found: {api_key[:20]}...")
+
+            # Format the prompt
+            prompt = f"""Answer the following question or instruction concisely and directly. Output ONLY the answer and NOTHING ELSE. No explanations, no preamble, no postamble.
+
+If asking for a command, provide only the command.
+If asking for a translation, provide only the translated word/phrase.
+If asking for information, provide a brief 1-2 sentence answer.
+
+Question/Instruction: {question}"""
+
+            # Prepare API request
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/parakeet-transcribe",
+            }
+
+            data = {
+                "model": "google/gemini-2.5-flash-preview-09-2025",
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ]
+            }
+
+            print("\n🌐 Calling OpenRouter API...")
+            print(f"   URL: {url}")
+            print(f"   Model: {data['model']}")
+            print(f"   Question: {question}")
+
+            # Make API request
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(data).encode('utf-8'),
+                headers=headers,
+                method='POST'
+            )
+
+            with urllib.request.urlopen(req, timeout=30) as response:
+                print(f"   Response status: {response.status}")
+                response_data = json.loads(response.read().decode('utf-8'))
+                print(f"   Response keys: {list(response_data.keys())}")
+                answer = response_data['choices'][0]['message']['content'].strip()
+                print(f"\n✅ LLM ask complete")
+                print(f"   Answer length: {len(answer)}")
+                print(f"   Answer: {answer[:200]}..." if len(answer) > 200 else f"   Answer: {answer}")
+                print("="*60 + "\n")
+                return answer
+
+        except urllib.error.URLError as e:
+            print(f"Error calling OpenRouter API: {e}")
+            print("Falling back to original question")
+            return question
+        except KeyError as e:
+            print(f"Error parsing API response: {e}")
+            print("Falling back to original question")
+            return question
+        except Exception as e:
+            print(f"Unexpected error in LLM ask: {e}")
+            print("Falling back to original question")
+            return question
 
     def _transform_with_llm(self, instruction):
         """Transform clipboard content using transcription as instruction.
@@ -513,7 +634,7 @@ Text:
             }
 
             data = {
-                "model": "anthropic/claude-sonnet-4.5",
+                "model": "google/gemini-2.5-flash-preview-09-2025",
                 "messages": [
                     {"role": "user", "content": prompt}
                 ]
@@ -613,7 +734,7 @@ Keep the overall tone academic, exclamation marks are unusual. Output only the f
             }
 
             data = {
-                "model": "anthropic/claude-sonnet-4.5",
+                "model": "google/gemini-2.5-flash-preview-09-2025",
                 "messages": [
                     {"role": "user", "content": prompt}
                 ]
@@ -656,8 +777,15 @@ Keep the overall tone academic, exclamation marks are unusual. Output only the f
             print("Falling back to original transcription")
             return transcription
 
-    def _transcribe(self, audio_data):
-        """Transcribe audio in a separate thread."""
+    def _transcribe(self, audio_data, use_llm=False, use_transform=False, use_ask=False):
+        """Transcribe audio in a separate thread.
+
+        Args:
+            audio_data: The audio data to transcribe
+            use_llm: Whether to use LLM insert mode
+            use_transform: Whether to use LLM transform mode
+            use_ask: Whether to use LLM ask mode
+        """
         try:
             # Update to transcribing state
             self._update_tray_icon("transcribing")
@@ -688,16 +816,19 @@ Keep the overall tone academic, exclamation marks are unusual. Output only the f
 
             # Copy to clipboard and paste
             if result and result.strip():
-                # Process with LLM if enabled
-                print(f"DEBUG: use_llm flag is: {self.use_llm}, use_transform flag is: {self.use_transform}")
-                if self.use_transform:
+                # Process with LLM if enabled (using captured flags, not self.use_*)
+                print(f"DEBUG: use_llm={use_llm}, use_transform={use_transform}, use_ask={use_ask}")
+                if use_ask:
+                    result = self._ask_llm(result)
+                    print(f"After LLM Ask: {result}")
+                elif use_transform:
                     result = self._transform_with_llm(result)
                     print(f"After LLM Transform: {result}")
-                elif self.use_llm:
+                elif use_llm:
                     result = self._process_with_llm(result)
                     print(f"After LLM: {result}")
                 else:
-                    print("DEBUG: Skipping LLM processing (both flags are False)")
+                    print("DEBUG: Skipping LLM processing (all flags are False)")
 
                 try:
                     # Copy to clipboard (Wayland) with trailing space
@@ -712,20 +843,26 @@ Keep the overall tone academic, exclamation marks are unusual. Output only the f
         except Exception as e:
             print(f"Error during transcription: {e}")
         finally:
-            # Reset LLM flags and return to idle state after transcription
-            self.use_llm = False
-            self.use_transform = False
+            # Return to idle state after transcription
+            # Note: flags are already reset before starting this thread
             self._update_tray_icon("idle")
 
     def Toggle(self):
         if self.is_recording:
             self.StopRecording()
         else:
+            # Regular toggle - reset all LLM modes
+            self.use_llm = False
+            self.use_transform = False
+            self.use_ask = False
             self.StartRecording()
 
     def StartRecordingLLM(self):
         """Start recording with LLM processing enabled."""
         print("🤖 LLM mode ENABLED")
+        # Reset all other modes first
+        self.use_ask = False
+        self.use_transform = False
         self.use_llm = True
         self.StartRecording()
 
@@ -747,6 +884,9 @@ Keep the overall tone academic, exclamation marks are unusual. Output only the f
     def StartRecordingTransform(self):
         """Start recording with LLM transform mode enabled."""
         print("🔄 Transform mode ENABLED")
+        # Reset all other modes first
+        self.use_llm = False
+        self.use_ask = False
         self.use_transform = True
         self.StartRecording()
 
@@ -764,6 +904,30 @@ Keep the overall tone academic, exclamation marks are unusual. Output only the f
             self.StopRecordingTransform()
         else:
             self.StartRecordingTransform()
+
+    def StartRecordingAsk(self):
+        """Start recording with LLM ask mode enabled."""
+        print("💭 Ask mode ENABLED")
+        # Reset all other modes first
+        self.use_llm = False
+        self.use_transform = False
+        self.use_ask = True
+        self.StartRecording()
+
+    def StopRecordingAsk(self):
+        """Stop recording and ask LLM the question."""
+        if self.use_ask:
+            self.StopRecording()
+            # Note: use_ask flag will be reset in transcription methods after processing
+        else:
+            print("Not in ask recording mode")
+
+    def ToggleAsk(self):
+        """Toggle recording with LLM ask mode."""
+        if self.is_recording:
+            self.StopRecordingAsk()
+        else:
+            self.StartRecordingAsk()
 
 if __name__ == '__main__':
     # Parse command-line arguments
