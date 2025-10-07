@@ -10,6 +10,9 @@ import shutil
 import time
 import threading
 import argparse
+import json
+import urllib.request
+import urllib.error
 import gi
 gi.require_version('Gtk', '3.0')
 try:
@@ -89,6 +92,12 @@ class ParakeetService:
             <method name='StartRecording'/>
             <method name='StopRecording'/>
             <method name='Toggle'/>
+            <method name='StartRecordingLLM'/>
+            <method name='StopRecordingLLM'/>
+            <method name='ToggleLLM'/>
+            <method name='StartRecordingTransform'/>
+            <method name='StopRecordingTransform'/>
+            <method name='ToggleTransform'/>
         </interface>
     </node>
     """
@@ -110,6 +119,8 @@ class ParakeetService:
         self.audio_frames = []
         self.stream = None
         self.tray_icon = None
+        self.use_llm = False  # Track whether to use LLM processing (insert mode)
+        self.use_transform = False  # Track whether to use LLM transform mode
 
         with suppress_stderr():
             self.p = pyaudio.PyAudio()
@@ -414,6 +425,25 @@ class ParakeetService:
         print(final_text)
         print(f"{'=' * 60}\n")
 
+        # Process with LLM if enabled
+        print(f"DEBUG: use_llm flag is: {self.use_llm}, use_transform flag is: {self.use_transform}")
+        if self.use_transform:
+            final_text = self._transform_with_llm(final_text)
+            print(f"\n{'=' * 60}")
+            print(f"📝 After LLM Transform:")
+            print(f"{'=' * 60}")
+            print(final_text)
+            print(f"{'=' * 60}\n")
+        elif self.use_llm:
+            final_text = self._process_with_llm(final_text)
+            print(f"\n{'=' * 60}")
+            print(f"📝 After LLM Processing:")
+            print(f"{'=' * 60}")
+            print(final_text)
+            print(f"{'=' * 60}\n")
+        else:
+            print("DEBUG: Skipping LLM processing (both flags are False)")
+
         # Copy to clipboard and paste (same as standard mode)
         try:
             # Copy to clipboard (Wayland) with trailing space
@@ -426,8 +456,205 @@ class ParakeetService:
         except Exception as e:
             print(f"Could not paste result: {e}. Result: {final_text}")
 
-        # Return to idle state
+        # Reset LLM flags and return to idle state
+        self.use_llm = False
+        self.use_transform = False
         self._update_tray_icon("idle")
+
+    def _transform_with_llm(self, instruction):
+        """Transform clipboard content using transcription as instruction.
+
+        Args:
+            instruction: The transcribed instruction (e.g., "correct the spelling")
+
+        Returns:
+            The transformed text from the LLM, or the original clipboard if processing fails
+        """
+        try:
+            print("\n" + "="*60)
+            print("🔄 LLM TRANSFORM MODE DEBUG")
+            print("="*60)
+
+            # Get current clipboard content
+            print("📋 Reading clipboard...")
+            result = subprocess.run(['wl-paste'], capture_output=True, text=True, check=False)
+            clipboard_text = result.stdout if result.returncode == 0 else ""
+            print(f"   Return code: {result.returncode}")
+            print(f"   Clipboard content length: {len(clipboard_text)}")
+            print(f"   Clipboard content: {clipboard_text[:100]}..." if len(clipboard_text) > 100 else f"   Clipboard content: {clipboard_text}")
+
+            # If clipboard is empty, return instruction as-is
+            if not clipboard_text.strip():
+                print("⚠️  Clipboard empty, returning instruction as-is")
+                return instruction
+
+            # Get API key
+            print("\n🔑 Checking API key...")
+            api_key = os.environ.get('OPENROUTER_API_KEY', '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')
+            if not api_key:
+                print("❌ OPENROUTER_API_KEY not set, returning clipboard as-is")
+                return clipboard_text
+            print(f"   API key found: {api_key[:20]}...")
+
+            # Format the prompt
+            prompt = f"""You will receive an instruction and a text. Apply the instruction to the text or answer the question asked about the text, give short and concise answers in 1 - 2 sentences. Output ONLY the transformed text OR your answer and NOTHING ELSE. No explanations, no preamble, no postamble.
+
+Instruction: {instruction}
+
+Text:
+{clipboard_text}"""
+
+            # Prepare API request
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/parakeet-transcribe",
+            }
+
+            data = {
+                "model": "anthropic/claude-sonnet-4.5",
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ]
+            }
+
+            print("\n🌐 Calling OpenRouter API...")
+            print(f"   URL: {url}")
+            print(f"   Model: {data['model']}")
+            print(f"   Instruction: {instruction}")
+
+            # Make API request
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(data).encode('utf-8'),
+                headers=headers,
+                method='POST'
+            )
+
+            with urllib.request.urlopen(req, timeout=30) as response:
+                print(f"   Response status: {response.status}")
+                response_data = json.loads(response.read().decode('utf-8'))
+                print(f"   Response keys: {list(response_data.keys())}")
+                transformed_text = response_data['choices'][0]['message']['content'].strip()
+                print(f"\n✅ LLM transform complete")
+                print(f"   Transformed text length: {len(transformed_text)}")
+                print(f"   Transformed text: {transformed_text[:200]}..." if len(transformed_text) > 200 else f"   Transformed text: {transformed_text}")
+                print("="*60 + "\n")
+                return transformed_text
+
+        except urllib.error.URLError as e:
+            print(f"Error calling OpenRouter API: {e}")
+            print("Falling back to original clipboard")
+            return clipboard_text
+        except KeyError as e:
+            print(f"Error parsing API response: {e}")
+            print("Falling back to original clipboard")
+            return clipboard_text
+        except Exception as e:
+            print(f"Unexpected error in LLM transform: {e}")
+            print("Falling back to original clipboard")
+            return clipboard_text
+
+    def _process_with_llm(self, transcription):
+        """Process transcription with LLM to insert it into clipboard content.
+
+        Args:
+            transcription: The transcribed text to insert
+
+        Returns:
+            The processed text from the LLM, or the original transcription if processing fails
+        """
+        try:
+            print("\n" + "="*60)
+            print("🤖 LLM PROCESSING DEBUG")
+            print("="*60)
+
+            # Get current clipboard content
+            print("📋 Reading clipboard...")
+            result = subprocess.run(['wl-paste'], capture_output=True, text=True, check=False)
+            existing_text = result.stdout if result.returncode == 0 else ""
+            print(f"   Return code: {result.returncode}")
+            print(f"   Clipboard content length: {len(existing_text)}")
+            print(f"   Clipboard content: {existing_text[:100]}..." if len(existing_text) > 100 else f"   Clipboard content: {existing_text}")
+
+            # If clipboard is empty, just return the transcription
+            if not existing_text.strip():
+                print("⚠️  Clipboard empty, returning transcription as-is")
+                return transcription
+
+            # Get API key from environment or use hardcoded fallback
+            print("\n🔑 Checking API key...")
+            api_key = os.environ.get('OPENROUTER_API_KEY', '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')
+            if not api_key:
+                print("❌ OPENROUTER_API_KEY not set, returning transcription as-is")
+                return transcription
+            print(f"   API key found: {api_key[:20]}...")
+
+            # Format the prompt
+            prompt = f"""I'm giving you a short piece of text, as well as another short text that should be inserted into the first text. If you find an underline with spaces around in the text, the insertion should go there, if not, the insertion should go at the end of the text. Make the insertion fit into the text or at the end. Especially regarding punctuation marks and capitalization, you can also make small changes to words around the insertion to make it fit better, but only if necessary, keep the first text as close to the original as possible.
+The insertion is a transcript that is machine created and might contain words that were misunderstood. Sometimes there are specialized terms that can be corrected with the context from the rest of the text, check the existing text closely for names or specialized terms that could be wrong in the transcript. Fix that and repair other obvious artifacts of the transcription but keep as close to the original as possible.
+Keep the overall tone academic, exclamation marks are unusual. Output only the final text and NOTHING ELSE.
+
+<text>
+{existing_text}
+</text>
+
+<insertion>
+{transcription}
+</insertion>"""
+
+            # Prepare API request
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/parakeet-transcribe",
+            }
+
+            data = {
+                "model": "anthropic/claude-sonnet-4.5",
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ]
+            }
+
+            print("\n🌐 Calling OpenRouter API...")
+            print(f"   URL: {url}")
+            print(f"   Model: {data['model']}")
+            print(f"   Transcription to insert: {transcription[:100]}...")
+
+            # Make API request
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(data).encode('utf-8'),
+                headers=headers,
+                method='POST'
+            )
+
+            with urllib.request.urlopen(req, timeout=30) as response:
+                print(f"   Response status: {response.status}")
+                response_data = json.loads(response.read().decode('utf-8'))
+                print(f"   Response keys: {list(response_data.keys())}")
+                processed_text = response_data['choices'][0]['message']['content'].strip()
+                print(f"\n✅ LLM processing complete")
+                print(f"   Processed text length: {len(processed_text)}")
+                print(f"   Processed text: {processed_text[:200]}..." if len(processed_text) > 200 else f"   Processed text: {processed_text}")
+                print("="*60 + "\n")
+                return processed_text
+
+        except urllib.error.URLError as e:
+            print(f"Error calling OpenRouter API: {e}")
+            print("Falling back to original transcription")
+            return transcription
+        except KeyError as e:
+            print(f"Error parsing API response: {e}")
+            print("Falling back to original transcription")
+            return transcription
+        except Exception as e:
+            print(f"Unexpected error in LLM processing: {e}")
+            print("Falling back to original transcription")
+            return transcription
 
     def _transcribe(self, audio_data):
         """Transcribe audio in a separate thread."""
@@ -461,6 +688,17 @@ class ParakeetService:
 
             # Copy to clipboard and paste
             if result and result.strip():
+                # Process with LLM if enabled
+                print(f"DEBUG: use_llm flag is: {self.use_llm}, use_transform flag is: {self.use_transform}")
+                if self.use_transform:
+                    result = self._transform_with_llm(result)
+                    print(f"After LLM Transform: {result}")
+                elif self.use_llm:
+                    result = self._process_with_llm(result)
+                    print(f"After LLM: {result}")
+                else:
+                    print("DEBUG: Skipping LLM processing (both flags are False)")
+
                 try:
                     # Copy to clipboard (Wayland) with trailing space
                     subprocess.run(['wl-copy'], input=(result + ' ').encode(), check=True)
@@ -474,7 +712,9 @@ class ParakeetService:
         except Exception as e:
             print(f"Error during transcription: {e}")
         finally:
-            # Always return to idle state after transcription
+            # Reset LLM flags and return to idle state after transcription
+            self.use_llm = False
+            self.use_transform = False
             self._update_tray_icon("idle")
 
     def Toggle(self):
@@ -482,6 +722,48 @@ class ParakeetService:
             self.StopRecording()
         else:
             self.StartRecording()
+
+    def StartRecordingLLM(self):
+        """Start recording with LLM processing enabled."""
+        print("🤖 LLM mode ENABLED")
+        self.use_llm = True
+        self.StartRecording()
+
+    def StopRecordingLLM(self):
+        """Stop recording and process with LLM."""
+        if self.use_llm:
+            self.StopRecording()
+            # Note: use_llm flag will be reset in transcription methods after processing
+        else:
+            print("Not in LLM recording mode")
+
+    def ToggleLLM(self):
+        """Toggle recording with LLM processing."""
+        if self.is_recording:
+            self.StopRecordingLLM()
+        else:
+            self.StartRecordingLLM()
+
+    def StartRecordingTransform(self):
+        """Start recording with LLM transform mode enabled."""
+        print("🔄 Transform mode ENABLED")
+        self.use_transform = True
+        self.StartRecording()
+
+    def StopRecordingTransform(self):
+        """Stop recording and transform clipboard with transcription."""
+        if self.use_transform:
+            self.StopRecording()
+            # Note: use_transform flag will be reset in transcription methods after processing
+        else:
+            print("Not in transform recording mode")
+
+    def ToggleTransform(self):
+        """Toggle recording with LLM transform mode."""
+        if self.is_recording:
+            self.StopRecordingTransform()
+        else:
+            self.StartRecordingTransform()
 
 if __name__ == '__main__':
     # Parse command-line arguments
