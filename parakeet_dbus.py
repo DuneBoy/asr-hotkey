@@ -517,7 +517,7 @@ class ParakeetService:
 
             # Get API key
             print("\n🔑 Checking API key...")
-            api_key = os.environ.get('OPENROUTER_API_KEY', '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')
+            api_key = os.environ.get('OPENROUTER_API_KEY')
             if not api_key:
                 print("❌ OPENROUTER_API_KEY not set, returning question as-is")
                 return question
@@ -613,7 +613,7 @@ Question/Instruction: {question}"""
 
             # Get API key
             print("\n🔑 Checking API key...")
-            api_key = os.environ.get('OPENROUTER_API_KEY', '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')
+            api_key = os.environ.get('OPENROUTER_API_KEY')
             if not api_key:
                 print("❌ OPENROUTER_API_KEY not set, returning clipboard as-is")
                 return clipboard_text
@@ -708,7 +708,7 @@ Text:
 
             # Get API key from environment or use hardcoded fallback
             print("\n🔑 Checking API key...")
-            api_key = os.environ.get('OPENROUTER_API_KEY', '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')
+            api_key = os.environ.get('OPENROUTER_API_KEY')
             if not api_key:
                 print("❌ OPENROUTER_API_KEY not set, returning transcription as-is")
                 return transcription

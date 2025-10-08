@@ -88,6 +88,33 @@ systemctl --user status parakeet-dbus.service
 
 The first startup will take a while as it downloads and loads the Parakeet model (~2.8GB memory usage).
 
+### OpenRouter API key (optional)
+
+Some optional features use an LLM via OpenRouter (ask/transform/insert). To enable them, set your API key via a user environment file loaded by the systemd service.
+
+1) Create the environment file:
+
+```bash
+mkdir -p ~/.config/parakeet
+printf 'OPENROUTER_API_KEY=sk-or-...\n' > ~/.config/parakeet/parakeet.env
+chmod 600 ~/.config/parakeet/parakeet.env
+```
+
+2) Reload and restart the user service:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart parakeet-dbus.service
+```
+
+3) Verify the key is picked up (look for a log line like "API key found"):
+
+```bash
+journalctl --user -u parakeet-dbus.service -f
+```
+
+If the key is not set, LLM features will gracefully fall back (no external call).
+
 ## Configure Hyprland Hotkey
 
 Add this line to your Hyprland hotkeys config:
@@ -96,12 +123,73 @@ Add this line to your Hyprland hotkeys config:
 bind = , F12, exec, dbus-send --session --dest=com.parakeet.Transcribe --type=method_call /com/parakeet/Transcribe com.parakeet.Transcribe.Toggle
 ```
 
+### Optional: Hotkeys for LLM modes
+
+If you enabled the OpenRouter API key, you can bind additional hotkeys for the LLM-powered modes:
+
+```
+# Ask mode: speak a question/command; pastes concise answer
+bind = , F9,  exec, dbus-send --session --dest=com.parakeet.Transcribe --type=method_call /com/parakeet/Transcribe com.parakeet.Transcribe.ToggleAsk
+
+# Transform mode: speak an instruction to transform current clipboard text; pastes transformed text
+bind = , F10, exec, dbus-send --session --dest=com.parakeet.Transcribe --type=method_call /com/parakeet/Transcribe com.parakeet.Transcribe.ToggleTransform
+
+# Insert mode: speak text to insert into clipboard content; pastes merged text
+bind = , F11, exec, dbus-send --session --dest=com.parakeet.Transcribe --type=method_call /com/parakeet/Transcribe com.parakeet.Transcribe.ToggleLLM
+```
+
 ## Usage
 
 1. Press **F12** to start recording
 2. Speak your text
 3. Press **F12** again to stop recording
 4. The transcription will be automatically pasted at your cursor position using Ctrl+Shift+V
+
+## LLM Features (optional)
+
+Parakeet includes three optional LLM-powered workflows that build on top of local speech recognition. These require an OpenRouter API key and internet connectivity. Without a key, these features are skipped gracefully.
+
+- Ask mode (`ToggleAsk`)
+  - Speak a question or instruction. The LLM returns a short, direct answer which is pasted.
+  - Example: “Translate ‘good morning’ to French.” → pastes “bonjour”.
+
+- Transform mode (`ToggleTransform`)
+  - Speak an instruction; the LLM applies it to your current clipboard content and pastes the result.
+  - Example: “Summarize in one sentence.”
+
+- Insert mode (`ToggleLLM`)
+  - Speak text to insert into the clipboard content. The LLM merges it in-place (or at the end), adjusting punctuation/casing minimally.
+  - Example: Insert a short sentence into a paragraph on your clipboard.
+
+### D-Bus commands
+
+You can trigger these directly via D-Bus as well:
+
+```bash
+# Ask mode
+dbus-send --session --dest=com.parakeet.Transcribe --type=method_call \
+  /com/parakeet/Transcribe com.parakeet.Transcribe.StartRecordingAsk
+dbus-send --session --dest=com.parakeet.Transcribe --type=method_call \
+  /com/parakeet/Transcribe com.parakeet.Transcribe.StopRecordingAsk
+
+# Transform mode
+dbus-send --session --dest=com.parakeet.Transcribe --type=method_call \
+  /com/parakeet/Transcribe com.parakeet.Transcribe.StartRecordingTransform
+dbus-send --session --dest=com.parakeet.Transcribe --type=method_call \
+  /com/parakeet/Transcribe com.parakeet.Transcribe.StopRecordingTransform
+
+# Insert mode
+dbus-send --session --dest=com.parakeet.Transcribe --type=method_call \
+  /com/parakeet/Transcribe com.parakeet.Transcribe.StartRecordingLLM
+dbus-send --session --dest=com.parakeet.Transcribe --type=method_call \
+  /com/parakeet/Transcribe com.parakeet.Transcribe.StopRecordingLLM
+```
+
+### Model and privacy
+
+- Default OpenRouter model: `google/gemini-2.5-flash-preview-09-2025`.
+- You may change the model by editing the `model` field in `parakeet_dbus.py` where the OpenRouter request payload is constructed.
+- Using these features sends your prompt and relevant text to the selected OpenRouter model provider; avoid sensitive data.
 
 ## Troubleshooting
 
@@ -155,4 +243,3 @@ Uses the NVIDIA Parakeet TDT 0.6B v3 model via onnx-asr:
 - Automatic download on first run
 - ~2.8GB memory usage when loaded
 - Multilanguage - you can even switch language while speaking.
-

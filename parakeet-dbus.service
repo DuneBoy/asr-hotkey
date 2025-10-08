@@ -6,6 +6,7 @@ After=sound.target
 Type=simple
 ExecStart=/usr/bin/uv run python3 -u %h/.local/share/parakeet/parakeet_dbus.py
 WorkingDirectory=%h/.local/share/parakeet
+EnvironmentFile=%h/.config/parakeet/parakeet.env
 Environment="YDOTOOL_SOCKET=/run/ydotool/socket"
 Environment="WAYLAND_DISPLAY=wayland-1"
 Environment="XDG_RUNTIME_DIR=/run/user/%U"
