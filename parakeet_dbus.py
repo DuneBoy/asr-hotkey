@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
+import argparse
+import contextlib
+import enum
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import wave
+
 import onnx_asr
 import pyaudio
-import wave
-import os
-import sys
-import subprocess
-import contextlib
-import shutil
-import time
-import threading
-import argparse
-import json
-import urllib.request
-import urllib.error
+
 import gi
 gi.require_version('Gtk', '3.0')
 try:
@@ -35,6 +38,7 @@ except ImportError as e:
     HAS_STREAMING = False
     print(f"Warning: Streaming components not available ({e})")
 
+
 @contextlib.contextmanager
 def suppress_stderr():
     devnull = os.open(os.devnull, os.O_WRONLY)
@@ -48,6 +52,7 @@ def suppress_stderr():
         os.dup2(old_stderr, 2)
         os.close(old_stderr)
 
+
 def create_icon_file(state="idle"):
     """Create a colored icon file for the tray based on state.
 
@@ -57,7 +62,6 @@ def create_icon_file(state="idle"):
     from PIL import Image, ImageDraw
     import os
 
-    # Color mapping - bright, clear colors
     colors = {
         "idle": (100, 100, 100),       # Gray
         "recording": (255, 0, 0),       # Bright Red
@@ -66,24 +70,220 @@ def create_icon_file(state="idle"):
 
     color = colors.get(state, colors["idle"])
 
-    # Create icon directory if it doesn't exist
     icon_dir = os.path.expanduser("~/.local/share/parakeet/icons")
     os.makedirs(icon_dir, exist_ok=True)
 
-    # Icon file path
     icon_path = os.path.join(icon_dir, f"parakeet-{state}.png")
 
-    # Always recreate to ensure correct color
-    # Create a 48x48 image
     img = Image.new('RGBA', (48, 48), color=(0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-
-    # Draw simple filled circle
     draw.ellipse([8, 8, 40, 40], fill=color)
-
     img.save(icon_path, 'PNG')
 
     return icon_path
+
+
+class ServiceState(enum.Enum):
+    IDLE = "idle"
+    RECORDING = "recording"
+    PROCESSING = "transcribing"
+
+
+class TranscriptionMode(enum.Enum):
+    NORMAL = "normal"
+    LLM_INSERT = "llm_insert"
+    LLM_TRANSFORM = "llm_transform"
+    LLM_ASK = "llm_ask"
+
+
+class TranscriptionSession:
+    """Encapsulates a single end-to-end transcription session.
+
+    Coordinates recording and transcription in a single background thread to
+    avoid multi-threaded races. Reports state transitions and final results via
+    callbacks supplied by the service.
+    """
+
+    def __init__(
+        self,
+        *,
+        service_ref,
+        mode: TranscriptionMode,
+        streaming: bool,
+        window_seconds: float | None = None,
+        slide_seconds: float | None = None,
+        start_delay_seconds: float | None = None,
+    ):
+        self._service = service_ref
+        self.mode = mode
+        self.streaming = streaming and HAS_STREAMING
+
+        # Streaming parameters
+        self.window_seconds = window_seconds or 7.0
+        self.slide_seconds = slide_seconds or 3.0
+        self.start_delay_seconds = start_delay_seconds or 6.0
+
+        # Runtime state
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+        # For standard mode
+        self._frames: list[bytes] = []
+
+        # For streaming mode
+        self._streaming_recorder: StreamingRecorder | None = None
+        self._chunk_merger: ChunkMerger | None = None
+
+    # ---- Public API ----
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, name="TranscriptionSession", daemon=True)
+        self._thread.start()
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+
+    # ---- Internals ----
+    def _run(self) -> None:
+        try:
+            # Recording phase
+            self._service._on_session_state_change(ServiceState.RECORDING)
+            if self.streaming:
+                self._run_streaming()
+            else:
+                self._run_standard()
+        except Exception as e:
+            print(f"Session error: {e}")
+            # Ensure we return to idle
+            try:
+                self._service._on_session_state_change(ServiceState.IDLE)
+            except Exception:
+                pass
+
+    def _run_standard(self) -> None:
+        # Blockingly record using a dedicated thread loop to avoid callback races
+        pa = self._service.p
+        fmt = self._service.FORMAT
+        channels = self._service.CHANNELS
+        rate = self._service.supported_rate
+        chunk = self._service.CHUNK
+
+        stream = None
+        try:
+            stream = pa.open(
+                format=fmt,
+                channels=channels,
+                rate=rate,
+                input=True,
+                frames_per_buffer=chunk,
+            )
+            while not self._stop_event.is_set():
+                data = stream.read(chunk, exception_on_overflow=False)
+                self._frames.append(data)
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception as e:
+                    print(f"Warning: error closing stream: {e}")
+
+        # Processing phase
+        if not self._frames or len(self._frames) < 5:
+            print("Recording too short, ignoring...")
+            self._service._on_session_state_change(ServiceState.IDLE)
+            return
+
+        self._service._on_session_state_change(ServiceState.PROCESSING)
+
+        audio_data = b"".join(self._frames)
+        # Save raw recording
+        wf = wave.open(self._service.RAW_FILE, 'wb')
+        wf.setnchannels(channels)
+        wf.setsampwidth(pa.get_sample_size(fmt))
+        wf.setframerate(rate)
+        wf.writeframes(audio_data)
+        wf.close()
+
+        # Resample if needed
+        if rate != self._service.MODEL_RATE:
+            try:
+                subprocess.run(
+                    ['ffmpeg', '-y', '-i', self._service.RAW_FILE, '-ar', str(self._service.MODEL_RATE), self._service.TEMP_FILE],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True
+                )
+            except Exception as e:
+                print(f"Error during resampling: {e}")
+                self._service._on_session_state_change(ServiceState.IDLE)
+                return
+        else:
+            shutil.copy(self._service.RAW_FILE, self._service.TEMP_FILE)
+
+        # Recognize
+        print("Transcribing...")
+        result = self._service.model.recognize(self._service.TEMP_FILE)
+        result = result.strip() if result else ""
+        self._service._on_session_final(result, self.mode)
+
+    def _run_streaming(self) -> None:
+        # Initialize streaming helpers
+        self._streaming_recorder = StreamingRecorder(
+            audio_instance=self._service.p,
+            sample_rate=self._service.MODEL_RATE,
+            channels=self._service.CHANNELS,
+            window_seconds=self.window_seconds,
+            slide_seconds=self.slide_seconds,
+            start_delay_seconds=self.start_delay_seconds,
+        )
+        self._chunk_merger = ChunkMerger()
+
+        # Start audio
+        self._streaming_recorder.start_recording()
+        print("🔄 Streaming processor started")
+        print(f"   Window: {self.window_seconds}s, Slide: {self.slide_seconds}s")
+        overlap = self.window_seconds - self.slide_seconds
+        print(f"   Overlap: {overlap}s")
+
+        # Consume chunks while recording or until queue drains
+        while not self._stop_event.is_set() or not self._streaming_recorder.processing_queue.empty():
+            chunk_np = self._streaming_recorder.get_next_chunk()
+            if chunk_np is None:
+                time.sleep(0.1)
+                continue
+            # Transcribe this chunk
+            chunk_file = self._streaming_recorder.save_chunk_to_file(chunk_np, int(time.time()))
+            if not chunk_file:
+                continue
+            try:
+                text = self._service.model.recognize(chunk_file)
+                text = text.strip() if text else ""
+            finally:
+                try:
+                    os.remove(chunk_file)
+                except Exception:
+                    pass
+            if text:
+                merged = self._chunk_merger.add_chunk(text, is_final=False)
+                print(f"  ⚡ Chunk: {text[:50]}...")
+                print(f"     Merged ({len(merged.split())} words): ...{merged[-80:]}")
+
+        print("🔄 Streaming processor stopped")
+
+        # Stop recording and finalize
+        _ = self._streaming_recorder.stop_recording()
+        # If nothing processed, bail out
+        final_text = self._chunk_merger.get_result() if self._chunk_merger else ""
+        if not final_text:
+            print("No text transcribed")
+            self._service._on_session_state_change(ServiceState.IDLE)
+            return
+
+        # Move to processing (for UI purposes) right before finalization
+        self._service._on_session_state_change(ServiceState.PROCESSING)
+        self._service._on_session_final(final_text, self.mode)
 
 class ParakeetService:
     """
@@ -106,7 +306,7 @@ class ParakeetService:
     """
 
     def __init__(self, streaming_mode=False, window_seconds=7.0, slide_seconds=3.0, start_delay_seconds=6.0):
-        print("Loading model...")
+        print("Loading model... This may take a few seconds...")
         self.model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3")
         print("Model loaded!")
 
@@ -118,59 +318,44 @@ class ParakeetService:
         self.TEMP_FILE = "/tmp/parakeet_recording.wav"
         self.RAW_FILE = "/tmp/parakeet_recording_raw.wav"
 
-        self.is_recording = False
-        self.audio_frames = []
-        self.stream = None
+        # Core state
+        self._lock = threading.RLock()
+        self._state: ServiceState = ServiceState.IDLE
+        self._session: TranscriptionSession | None = None
+
+        # UI
         self.tray_icon = None
-        self.use_llm = False  # Track whether to use LLM processing (insert mode)
-        self.use_transform = False  # Track whether to use LLM transform mode
-        self.use_ask = False  # Track whether to use LLM ask mode (direct questions)
 
         with suppress_stderr():
             self.p = pyaudio.PyAudio()
 
-        # Streaming mode settings
-        self.streaming_mode = streaming_mode and HAS_STREAMING
-        self.streaming_recorder = None
-        self.chunk_merger = None
-        self.transcription_thread = None
-        self.is_transcribing = False
-        self.chunk_counter = 0
+        # Streaming configuration
+        self.streaming_mode = bool(streaming_mode and HAS_STREAMING)
+        self._window_seconds = window_seconds
+        self._slide_seconds = slide_seconds
+        self._start_delay_seconds = start_delay_seconds
+        if streaming_mode and not HAS_STREAMING:
+            print("Warning: Streaming mode requested but components not available, falling back to standard mode")
 
-        if self.streaming_mode:
-            print(f"Streaming mode enabled (window: {window_seconds}s, slide: {slide_seconds}s)")
-            self.streaming_recorder = StreamingRecorder(
-                audio_instance=self.p,
-                sample_rate=self.MODEL_RATE,
-                channels=self.CHANNELS,
-                window_seconds=window_seconds,
-                slide_seconds=slide_seconds,
-                start_delay_seconds=start_delay_seconds,
-            )
-            self.chunk_merger = ChunkMerger()
-        elif streaming_mode and not HAS_STREAMING:
-            print("Warning: Streaming mode requested but components not available, using standard mode")
-
-        # Find supported sample rate
+        # Detect usable input rate once
         print("Detecting supported sample rate...")
         self.supported_rate = None
         for test_rate in [48000, 44100, 32000, 22050, 16000, 8000]:
             try:
                 with suppress_stderr():
-                    test_stream = self.p.open(
+                    s = self.p.open(
                         format=self.FORMAT,
                         channels=self.CHANNELS,
                         rate=test_rate,
                         input=True,
-                        frames_per_buffer=self.CHUNK
+                        frames_per_buffer=self.CHUNK,
                     )
-                    test_stream.close()
+                    s.close()
                 self.supported_rate = test_rate
                 print(f"Using sample rate: {self.supported_rate} Hz")
                 break
-            except:
+            except Exception:
                 continue
-
         if not self.supported_rate:
             print("Error: Could not find supported sample rate")
             sys.exit(1)
@@ -185,28 +370,17 @@ class ParakeetService:
             return
 
         try:
-            # Create menu
             menu = Gtk.Menu()
-
-            # Toggle item
             toggle_item = Gtk.MenuItem(label="Toggle Recording")
             toggle_item.connect("activate", lambda _: self._tray_toggle())
             menu.append(toggle_item)
-
-            # Separator
             menu.append(Gtk.SeparatorMenuItem())
-
-            # Quit item
             quit_item = Gtk.MenuItem(label="Quit")
             quit_item.connect("activate", lambda _: self._tray_quit())
             menu.append(quit_item)
-
             menu.show_all()
 
-            # Create indicator
             icon_path = os.path.expanduser("~/.local/share/parakeet/icons")
-
-            # Pre-create all icons
             create_icon_file("idle")
             create_icon_file("recording")
             create_icon_file("transcribing")
@@ -214,14 +388,13 @@ class ParakeetService:
             self.tray_icon = AppIndicator.Indicator.new(
                 "parakeet",
                 "parakeet-idle",
-                AppIndicator.IndicatorCategory.APPLICATION_STATUS
+                AppIndicator.IndicatorCategory.APPLICATION_STATUS,
             )
             self.tray_icon.set_icon_theme_path(icon_path)
             self.tray_icon.set_attention_icon("parakeet-transcribing")
             self.tray_icon.set_status(AppIndicator.IndicatorStatus.ACTIVE)
             self.tray_icon.set_menu(menu)
             self.tray_icon.set_title("Parakeet (Idle)")
-
             print("System tray icon initialized")
         except Exception as e:
             print(f"Warning: Could not create system tray icon: {e}")
@@ -234,270 +407,99 @@ class ParakeetService:
 
     def _tray_quit(self):
         """Quit application from tray menu."""
-        if self.is_recording:
-            self.StopRecording()
+        with self._lock:
+            if self._state == ServiceState.RECORDING and self._session:
+                self._session.request_stop()
         if self.tray_icon:
             self.tray_icon.set_status(AppIndicator.IndicatorStatus.PASSIVE)
         os._exit(0)
 
-    def _update_tray_icon(self, state):
-        """Update the tray icon to reflect current state.
-
-        Args:
-            state: One of "idle", "recording", or "transcribing"
-        """
-        if self.tray_icon:
-            if state == "recording":
-                self.tray_icon.set_icon("parakeet-recording")
-                self.tray_icon.set_title("Parakeet (Recording)")
-            elif state == "transcribing":
-                self.tray_icon.set_icon("parakeet-transcribing")
-                self.tray_icon.set_title("Parakeet (Transcribing)")
-            else:
-                self.tray_icon.set_icon("parakeet-idle")
-                self.tray_icon.set_title("Parakeet (Idle)")
-
-    def StartRecording(self):
-        if self.is_recording:
-            print("Already recording")
+    def _update_tray_icon(self, state: ServiceState):
+        """Update tray icon based on state."""
+        if not self.tray_icon:
             return
-
-        print("Starting recording...")
-        # If called directly (not from LLM/Transform/Ask), reset all LLM modes
-        # The specific Start methods set their flags BEFORE calling this
-        self.is_recording = True
-        self._update_tray_icon("recording")
-
-        if self.streaming_mode:
-            # Use streaming recorder
-            self.chunk_counter = 0
-            self.chunk_merger.reset()
-            self.is_transcribing = True
-
-            # Start the streaming recorder
-            self.streaming_recorder.start_recording()
-
-            # Start transcription thread
-            self.transcription_thread = threading.Thread(
-                target=self._streaming_transcription_loop,
-                daemon=True
-            )
-            self.transcription_thread.start()
+        if state == ServiceState.RECORDING:
+            self.tray_icon.set_icon("parakeet-recording")
+            self.tray_icon.set_title("Parakeet (Recording)")
+        elif state == ServiceState.PROCESSING:
+            self.tray_icon.set_icon("parakeet-transcribing")
+            self.tray_icon.set_title("Parakeet (Transcribing)")
         else:
-            # Use standard recording
-            self.audio_frames = []
-            try:
-                self.stream = self.p.open(
-                    format=self.FORMAT,
-                    channels=self.CHANNELS,
-                    rate=self.supported_rate,
-                    input=True,
-                    frames_per_buffer=self.CHUNK,
-                    stream_callback=self._audio_callback
-                )
-                self.stream.start_stream()
-            except Exception as e:
-                print(f"Error opening audio stream: {e}")
-                self.is_recording = False
-                self._update_tray_icon("idle")
+            self.tray_icon.set_icon("parakeet-idle")
+            self.tray_icon.set_title("Parakeet (Idle)")
 
-    def _audio_callback(self, in_data, frame_count, time_info, status):
-        if self.is_recording:
-            self.audio_frames.append(in_data)
-        return (None, pyaudio.paContinue)
+    # ---- Session callbacks ----
+    def _on_session_state_change(self, new_state: ServiceState) -> None:
+        with self._lock:
+            # Ignore late callbacks from old sessions
+            if not self._session:
+                return
+            self._state = new_state
+            self._update_tray_icon(new_state)
+
+    def _on_session_final(self, text: str, mode: TranscriptionMode) -> None:
+        """Handle final text from a session: optional LLM, clipboard, reset state."""
+        processed_text = (text or '').strip()
+        if not processed_text:
+            print("No transcription result")
+        else:
+            # Optional LLM steps
+            print(f"DEBUG: mode={mode}")
+            try:
+                if mode == TranscriptionMode.LLM_ASK:
+                    processed_text = self._ask_llm(processed_text)
+                elif mode == TranscriptionMode.LLM_TRANSFORM:
+                    processed_text = self._transform_with_llm(processed_text)
+                elif mode == TranscriptionMode.LLM_INSERT:
+                    processed_text = self._process_with_llm(processed_text)
+            except Exception as e:
+                print(f"LLM processing error: {e}")
+
+            # Copy to clipboard and paste
+            try:
+                subprocess.run(['wl-copy'], input=(processed_text + ' ').encode(), check=True)
+                print("✓ Copied to clipboard")
+                subprocess.run(['ydotool', 'key', '29:1', '42:1', '47:1', '47:0', '42:0', '29:0'], check=True)
+                print("✓ Pasted")
+            except Exception as e:
+                print(f"Could not paste result: {e}. Result: {processed_text}")
+
+        # Reset service state
+        with self._lock:
+            self._session = None
+            self._state = ServiceState.IDLE
+            self._update_tray_icon(self._state)
+
+    # ---- D-Bus methods ----
+    def StartRecording(self):
+        self._start_session(TranscriptionMode.NORMAL)
 
     def StopRecording(self):
-        if not self.is_recording:
-            print("Not recording")
-            return
-
-        print("Stopping recording...")
-        self.is_recording = False
-
-        if self.streaming_mode:
-            # Stop streaming recorder
-            audio_data = self.streaming_recorder.stop_recording()
-
-            if not audio_data or len(audio_data) < self.supported_rate * 0.5:  # Less than 0.5s
-                print("Recording too short, ignoring...")
-                self.is_transcribing = False
-                self._update_tray_icon("idle")
+        with self._lock:
+            if self._state != ServiceState.RECORDING or not self._session:
+                print("Not recording")
                 return
+            print("Stopping recording...")
+            self._session.request_stop()
 
-            # Signal transcription thread to finish
-            self.is_transcribing = False
-
-            # Wait for transcription thread to process remaining chunks
-            if self.transcription_thread:
-                print("⏳ Processing remaining chunks...")
-                self.transcription_thread.join(timeout=30.0)
-
-            # Capture the current mode flags before finalizing
-            use_llm = self.use_llm
-            use_transform = self.use_transform
-            use_ask = self.use_ask
-
-            # Reset flags immediately so next recording can set them
-            self.use_llm = False
-            self.use_transform = False
-            self.use_ask = False
-
-            # Get final merged result with captured flags
-            self._finalize_transcription(use_llm, use_transform, use_ask)
-        else:
-            # Standard mode
-            if self.stream:
-                try:
-                    self.stream.stop_stream()
-                    self.stream.close()
-                except Exception as e:
-                    print(f"Warning: Error closing stream: {e}")
-                self.stream = None
-
-            # Check if we have enough audio
-            if not self.audio_frames or len(self.audio_frames) < 5:
-                print("Recording too short, ignoring...")
-                self._update_tray_icon("idle")
+    # ---- Core control helpers ----
+    def _start_session(self, mode: TranscriptionMode) -> None:
+        with self._lock:
+            if self._state != ServiceState.IDLE or self._session is not None:
+                print(f"Busy (state={self._state.value}), ignoring start request")
                 return
-
-            # Copy audio frames before threading
-            audio_data = b''.join(self.audio_frames)
-
-            # Capture the current mode flags before starting thread
-            use_llm = self.use_llm
-            use_transform = self.use_transform
-            use_ask = self.use_ask
-
-            # Reset flags immediately so next recording can set them
-            self.use_llm = False
-            self.use_transform = False
-            self.use_ask = False
-
-            # Run transcription in a separate thread with captured flags
-            transcribe_thread = threading.Thread(target=self._transcribe, args=(audio_data, use_llm, use_transform, use_ask), daemon=True)
-            transcribe_thread.start()
-
-    def _streaming_transcription_loop(self):
-        """Process audio chunks with sliding window approach."""
-        print("🔄 Streaming processor started")
-        print(f"   Window: {self.streaming_recorder.window_seconds}s, Slide: {self.streaming_recorder.slide_seconds}s")
-        overlap = self.streaming_recorder.window_seconds - self.streaming_recorder.slide_seconds
-        print(f"   Overlap: {overlap}s")
-
-        while self.is_transcribing or not self.streaming_recorder.processing_queue.empty():
-            chunk_np = self.streaming_recorder.get_next_chunk()
-
-            if chunk_np is not None:
-                self.chunk_counter += 1
-                is_last = not self.is_transcribing and self.streaming_recorder.processing_queue.empty()
-                self._transcribe_chunk(chunk_np, self.chunk_counter, is_last_chunk=is_last)
-            else:
-                # No chunk available yet
-                time.sleep(0.1)
-
-        print("🔄 Streaming processor stopped")
-
-    def _transcribe_chunk(self, chunk_np, chunk_id, is_last_chunk=False):
-        """Transcribe a single audio chunk and merge with existing result."""
-        try:
-            # Save chunk to file
-            chunk_file = self.streaming_recorder.save_chunk_to_file(chunk_np, chunk_id)
-            if not chunk_file:
-                return None
-
-            # Transcribe
-            print(f"  ⚡ Transcribing chunk {chunk_id}...")
-            result = self.model.recognize(chunk_file)
-            text = result.strip() if result else ""
-
-            # Clean up chunk file
-            try:
-                os.remove(chunk_file)
-            except:
-                pass
-
-            if text:
-                # Merge with existing result using overlap detection
-                merged = self.chunk_merger.add_chunk(text, is_final=is_last_chunk)
-
-                # Show progress
-                marker = "🏁" if is_last_chunk else "⚡"
-                print(f"  {marker} Chunk {chunk_id}: {text[:50]}...")
-                print(f"     Merged ({len(merged.split())} words): ...{merged[-80:]}")
-
-                return text
-            return None
-
-        except Exception as e:
-            print(f"Error transcribing chunk {chunk_id}: {e}")
-            return None
-
-    def _finalize_transcription(self, use_llm=False, use_transform=False, use_ask=False):
-        """Finalize and output the complete transcription.
-
-        Args:
-            use_llm: Whether to use LLM insert mode
-            use_transform: Whether to use LLM transform mode
-            use_ask: Whether to use LLM ask mode
-        """
-        # Update to transcribing state
-        self._update_tray_icon("transcribing")
-
-        # Get the merged result
-        final_text = self.chunk_merger.get_result()
-
-        if not final_text:
-            print("No text transcribed")
-            self._update_tray_icon("idle")
-            return
-
-        print(f"\n{'=' * 60}")
-        print(f"📝 Final Transcription:")
-        print(f"{'=' * 60}")
-        print(final_text)
-        print(f"{'=' * 60}\n")
-
-        # Process with LLM if enabled (using captured flags)
-        print(f"DEBUG: use_llm={use_llm}, use_transform={use_transform}, use_ask={use_ask}")
-        if use_ask:
-            final_text = self._ask_llm(final_text)
-            print(f"\n{'=' * 60}")
-            print(f"📝 After LLM Ask:")
-            print(f"{'=' * 60}")
-            print(final_text)
-            print(f"{'=' * 60}\n")
-        elif use_transform:
-            final_text = self._transform_with_llm(final_text)
-            print(f"\n{'=' * 60}")
-            print(f"📝 After LLM Transform:")
-            print(f"{'=' * 60}")
-            print(final_text)
-            print(f"{'=' * 60}\n")
-        elif use_llm:
-            final_text = self._process_with_llm(final_text)
-            print(f"\n{'=' * 60}")
-            print(f"📝 After LLM Processing:")
-            print(f"{'=' * 60}")
-            print(final_text)
-            print(f"{'=' * 60}\n")
-        else:
-            print("DEBUG: Skipping LLM processing (all flags are False)")
-
-        # Copy to clipboard and paste (same as standard mode)
-        try:
-            # Copy to clipboard (Wayland) with trailing space
-            subprocess.run(['wl-copy'], input=(final_text + ' ').encode(), check=True)
-            print("✓ Copied to clipboard")
-
-            # Paste using ydotool
-            subprocess.run(['ydotool', 'key', '29:1', '42:1', '47:1', '47:0', '42:0', '29:0'], check=True)
-            print("✓ Pasted")
-        except Exception as e:
-            print(f"Could not paste result: {e}. Result: {final_text}")
-
-        # Return to idle state
-        # Note: flags are already reset before calling this function
-        self._update_tray_icon("idle")
+            print("Starting recording...")
+            self._session = TranscriptionSession(
+                service_ref=self,
+                mode=mode,
+                streaming=self.streaming_mode,
+                window_seconds=self._window_seconds,
+                slide_seconds=self._slide_seconds,
+                start_delay_seconds=self._start_delay_seconds,
+            )
+            self._state = ServiceState.RECORDING
+            self._update_tray_icon(self._state)
+            self._session.start()
 
     def _ask_llm(self, question):
         """Ask the LLM a direct question and get a concise answer.
@@ -777,160 +779,67 @@ Keep the overall tone academic, exclamation marks are unusual. Output only the f
             print("Falling back to original transcription")
             return transcription
 
-    def _transcribe(self, audio_data, use_llm=False, use_transform=False, use_ask=False):
-        """Transcribe audio in a separate thread.
-
-        Args:
-            audio_data: The audio data to transcribe
-            use_llm: Whether to use LLM insert mode
-            use_transform: Whether to use LLM transform mode
-            use_ask: Whether to use LLM ask mode
-        """
-        try:
-            # Update to transcribing state
-            self._update_tray_icon("transcribing")
-
-            # Save raw recording
-            wf = wave.open(self.RAW_FILE, 'wb')
-            wf.setnchannels(self.CHANNELS)
-            wf.setsampwidth(self.p.get_sample_size(self.FORMAT))
-            wf.setframerate(self.supported_rate)
-            wf.writeframes(audio_data)
-            wf.close()
-
-            # Resample if needed
-            if self.supported_rate != self.MODEL_RATE:
-                subprocess.run(
-                    ['ffmpeg', '-y', '-i', self.RAW_FILE, '-ar', str(self.MODEL_RATE), self.TEMP_FILE],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True
-                )
-            else:
-                shutil.copy(self.RAW_FILE, self.TEMP_FILE)
-
-            # Transcribe
-            print("Transcribing...")
-            result = self.model.recognize(self.TEMP_FILE)
-            print(f"Result: {result}")
-
-            # Copy to clipboard and paste
-            if result and result.strip():
-                # Process with LLM if enabled (using captured flags, not self.use_*)
-                print(f"DEBUG: use_llm={use_llm}, use_transform={use_transform}, use_ask={use_ask}")
-                if use_ask:
-                    result = self._ask_llm(result)
-                    print(f"After LLM Ask: {result}")
-                elif use_transform:
-                    result = self._transform_with_llm(result)
-                    print(f"After LLM Transform: {result}")
-                elif use_llm:
-                    result = self._process_with_llm(result)
-                    print(f"After LLM: {result}")
-                else:
-                    print("DEBUG: Skipping LLM processing (all flags are False)")
-
-                try:
-                    # Copy to clipboard (Wayland) with trailing space
-                    subprocess.run(['wl-copy'], input=(result + ' ').encode(), check=True)
-
-                    # Paste using ydotool
-                    subprocess.run(['ydotool', 'key', '29:1', '42:1', '47:1', '47:0', '42:0', '29:0'], check=True)
-                except Exception as e:
-                    print(f"Could not paste result: {e}. Result: {result}")
-            else:
-                print("No transcription result")
-        except Exception as e:
-            print(f"Error during transcription: {e}")
-        finally:
-            # Return to idle state after transcription
-            # Note: flags are already reset before starting this thread
-            self._update_tray_icon("idle")
+    # Legacy helper removed in favor of TranscriptionSession
 
     def Toggle(self):
-        if self.is_recording:
-            self.StopRecording()
-        else:
-            # Regular toggle - reset all LLM modes
-            self.use_llm = False
-            self.use_transform = False
-            self.use_ask = False
-            self.StartRecording()
+        with self._lock:
+            if self._state == ServiceState.RECORDING:
+                self.StopRecording()
+            else:
+                self.StartRecording()
 
     def StartRecordingLLM(self):
-        """Start recording with LLM processing enabled."""
-        print("🤖 LLM mode ENABLED")
-        # Reset all other modes first
-        self.use_ask = False
-        self.use_transform = False
-        self.use_llm = True
-        self.StartRecording()
+        """Start recording with LLM insert mode enabled."""
+        print("🤖 LLM insert mode ENABLED")
+        self._start_session(TranscriptionMode.LLM_INSERT)
 
     def StopRecordingLLM(self):
-        """Stop recording and process with LLM."""
-        if self.use_llm:
-            self.StopRecording()
-            # Note: use_llm flag will be reset in transcription methods after processing
-        else:
-            print("Not in LLM recording mode")
+        """Stop recording (applies if currently recording)."""
+        self.StopRecording()
 
     def ToggleLLM(self):
-        """Toggle recording with LLM processing."""
-        if self.is_recording:
-            self.StopRecordingLLM()
-        else:
-            self.StartRecordingLLM()
+        """Toggle recording with LLM insert mode."""
+        with self._lock:
+            if self._state == ServiceState.RECORDING:
+                self.StopRecording()
+            else:
+                self.StartRecordingLLM()
 
     def StartRecordingTransform(self):
         """Start recording with LLM transform mode enabled."""
         print("🔄 Transform mode ENABLED")
-        # Reset all other modes first
-        self.use_llm = False
-        self.use_ask = False
-        self.use_transform = True
-        self.StartRecording()
+        self._start_session(TranscriptionMode.LLM_TRANSFORM)
 
     def StopRecordingTransform(self):
-        """Stop recording and transform clipboard with transcription."""
-        if self.use_transform:
-            self.StopRecording()
-            # Note: use_transform flag will be reset in transcription methods after processing
-        else:
-            print("Not in transform recording mode")
+        """Stop recording (applies if currently recording)."""
+        self.StopRecording()
 
     def ToggleTransform(self):
         """Toggle recording with LLM transform mode."""
-        if self.is_recording:
-            self.StopRecordingTransform()
-        else:
-            self.StartRecordingTransform()
+        with self._lock:
+            if self._state == ServiceState.RECORDING:
+                self.StopRecordingTransform()
+            else:
+                self.StartRecordingTransform()
 
     def StartRecordingAsk(self):
         """Start recording with LLM ask mode enabled."""
         print("💭 Ask mode ENABLED")
-        # Reset all other modes first
-        self.use_llm = False
-        self.use_transform = False
-        self.use_ask = True
-        self.StartRecording()
+        self._start_session(TranscriptionMode.LLM_ASK)
 
     def StopRecordingAsk(self):
-        """Stop recording and ask LLM the question."""
-        if self.use_ask:
-            self.StopRecording()
-            # Note: use_ask flag will be reset in transcription methods after processing
-        else:
-            print("Not in ask recording mode")
+        """Stop recording (applies if currently recording)."""
+        self.StopRecording()
 
     def ToggleAsk(self):
         """Toggle recording with LLM ask mode."""
-        if self.is_recording:
-            self.StopRecordingAsk()
-        else:
-            self.StartRecordingAsk()
+        with self._lock:
+            if self._state == ServiceState.RECORDING:
+                self.StopRecordingAsk()
+            else:
+                self.StartRecordingAsk()
 
 if __name__ == '__main__':
-    # Parse command-line arguments
     parser = argparse.ArgumentParser(
         description='Parakeet D-Bus transcription service',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -952,29 +861,10 @@ Streaming Mode:
   - Default: 7s windows with 3s slide (4s overlap)
         """
     )
-    parser.add_argument(
-        '--stream',
-        action='store_true',
-        help='Enable streaming mode with sliding window transcription'
-    )
-    parser.add_argument(
-        '--window',
-        type=float,
-        default=7.0,
-        help='Chunk window size in seconds (default: 7.0)'
-    )
-    parser.add_argument(
-        '--slide',
-        type=float,
-        default=3.0,
-        help='Slide interval in seconds (default: 3.0, overlap = window - slide)'
-    )
-    parser.add_argument(
-        '--delay',
-        type=float,
-        default=6.0,
-        help='Delay before starting streaming in seconds (default: 6.0)'
-    )
+    parser.add_argument('--stream', action='store_true', help='Enable streaming mode with sliding window transcription')
+    parser.add_argument('--window', type=float, default=7.0, help='Chunk window size in seconds (default: 7.0)')
+    parser.add_argument('--slide', type=float, default=3.0, help='Slide interval in seconds (default: 3.0)')
+    parser.add_argument('--delay', type=float, default=6.0, help='Delay before starting streaming in seconds (default: 6.0)')
 
     args = parser.parse_args()
 
@@ -984,7 +874,7 @@ Streaming Mode:
         streaming_mode=args.stream,
         window_seconds=args.window,
         slide_seconds=args.slide,
-        start_delay_seconds=args.delay
+        start_delay_seconds=args.delay,
     )
 
     bus.publish("com.parakeet.Transcribe", service)
