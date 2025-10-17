@@ -4,12 +4,11 @@ After=sound.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/uv run python3 -u %h/.local/share/parakeet/parakeet_dbus.py
-WorkingDirectory=%h/.local/share/parakeet
+ExecStartPre=/usr/bin/systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR
+ExecStart=/usr/bin/uv run python3 -u %h/AUR/asr-hotkey/parakeet_dbus.py
+WorkingDirectory=%h/AUR/asr-hotkey
 EnvironmentFile=%h/.config/parakeet/parakeet.env
 Environment="YDOTOOL_SOCKET=/run/ydotool/socket"
-Environment="WAYLAND_DISPLAY=wayland-1"
-Environment="XDG_RUNTIME_DIR=/run/user/%U"
 Environment="DISPLAY=:1"
 Restart=always
 RestartSec=5

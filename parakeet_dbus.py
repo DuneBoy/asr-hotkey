@@ -70,7 +70,7 @@ def create_icon_file(state="idle"):
 
     color = colors.get(state, colors["idle"])
 
-    icon_dir = os.path.expanduser("~/.local/share/parakeet/icons")
+    icon_dir = os.path.expanduser("~/AUR/asr-hotkey/icons")
     os.makedirs(icon_dir, exist_ok=True)
 
     icon_path = os.path.join(icon_dir, f"parakeet-{state}.png")
@@ -307,8 +307,21 @@ class ParakeetService:
 
     def __init__(self, streaming_mode=False, window_seconds=7.0, slide_seconds=3.0, start_delay_seconds=6.0):
         print("Loading model... This may take a few seconds...")
-        self.model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3")
+        
+        # Check available ONNX Runtime providers
+        import onnxruntime as rt
+        available_providers = rt.get_available_providers()
+        print(f"Available ONNX Runtime providers: {available_providers}")
+        
+        # Prioritize GPU (CUDA) over CPU for inference
+        self.model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v2", providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
         print("Model loaded!")
+        
+        # Verify which provider is being used
+        if 'CUDAExecutionProvider' in available_providers:
+            print("✓ GPU (CUDA) acceleration enabled")
+        else:
+            print("⚠ Warning: CUDA not available, falling back to CPU")
 
         # Audio settings
         self.CHUNK = 2048
@@ -380,7 +393,7 @@ class ParakeetService:
             menu.append(quit_item)
             menu.show_all()
 
-            icon_path = os.path.expanduser("~/.local/share/parakeet/icons")
+            icon_path = os.path.expanduser("~/AUR/asr-hotkey/icons")
             create_icon_file("idle")
             create_icon_file("recording")
             create_icon_file("transcribing")
