@@ -10,13 +10,18 @@ import numpy as np
 from collections import deque
 from datetime import datetime
 
+from audio_recorder import AudioConfig, RecordingResult
+
+
+# Constants
+CHUNK_TEMP_PATH = "/tmp/parakeet_chunk_{timestamp}_{chunk_id}.wav"
+
 
 class StreamingRecorder:
     def __init__(
         self,
         audio_instance,
-        sample_rate=16000,
-        channels=1,
+        config: AudioConfig,
         window_seconds=7.0,
         slide_seconds=3.0,
         start_delay_seconds=6.0,
@@ -26,17 +31,17 @@ class StreamingRecorder:
 
         Args:
             audio_instance: Existing PyAudio instance to use
-            sample_rate: Audio sample rate (default: 16000)
-            channels: Number of audio channels (default: 1)
+            config: AudioConfig with recording parameters
             window_seconds: Size of each chunk window (default: 7.0)
             slide_seconds: Interval between chunk starts (default: 3.0)
             start_delay_seconds: Delay before starting to process chunks (default: 6.0)
         """
         self.audio = audio_instance
-        self.sample_rate = sample_rate
-        self.channels = channels
+        self.config = config
+        self.sample_rate = config.supported_rate
+        self.channels = config.channels
         self.chunk = 1024
-        self.format = pyaudio.paInt16
+        self.format = config.format
 
         self.stream = None
         self.is_recording = False
@@ -47,9 +52,9 @@ class StreamingRecorder:
         self.start_delay_seconds = start_delay_seconds
 
         # Calculate samples
-        self.window_samples = int(sample_rate * window_seconds)
-        self.slide_samples = int(sample_rate * slide_seconds)
-        self.start_delay_samples = int(sample_rate * start_delay_seconds)
+        self.window_samples = int(self.sample_rate * window_seconds)
+        self.slide_samples = int(self.sample_rate * slide_seconds)
+        self.start_delay_samples = int(self.sample_rate * start_delay_seconds)
 
         # Buffer to hold all recorded audio
         self.all_frames = []
@@ -134,8 +139,13 @@ class StreamingRecorder:
         except queue.Empty:
             return None
 
-    def stop_recording(self):
-        """Stop recording and return audio data."""
+    def stop_recording(self) -> RecordingResult | None:
+        """
+        Stop recording and return recording result.
+        
+        Returns:
+            RecordingResult with all audio data and metadata, or None if no audio recorded
+        """
         if not self.is_recording:
             return None
 
@@ -150,13 +160,38 @@ class StreamingRecorder:
             print("No audio recorded")
             return None
 
-        # Return the raw audio frames
-        return b''.join(self.all_frames)
+        # Combine all frames
+        audio_data = b''.join(self.all_frames)
+        frame_count = len(self.all_frames)
+        
+        # Calculate duration
+        bytes_per_frame = len(self.all_frames[0]) if self.all_frames else 0
+        total_bytes = len(audio_data)
+        bytes_per_sample = self.audio.get_sample_size(self.format)
+        total_samples = total_bytes // (bytes_per_sample * self.channels)
+        duration = total_samples / self.sample_rate
+        
+        return RecordingResult(
+            audio_data=audio_data,
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+            duration_seconds=duration,
+            frame_count=frame_count
+        )
 
     def save_chunk_to_file(self, chunk_np, chunk_id):
-        """Save a chunk to a temporary WAV file for transcription."""
+        """
+        Save a chunk to a temporary WAV file for transcription.
+        
+        Args:
+            chunk_np: Numpy array of audio data
+            chunk_id: Unique identifier for the chunk
+            
+        Returns:
+            Path to saved file, or None if save failed
+        """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"/tmp/parakeet_chunk_{timestamp}_{chunk_id}.wav"
+        output_path = CHUNK_TEMP_PATH.format(timestamp=timestamp, chunk_id=chunk_id)
 
         try:
             with wave.open(output_path, "wb") as wf:

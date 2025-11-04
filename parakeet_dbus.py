@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 import argparse
-import contextlib
 import enum
 import json
 import os
-import shutil
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
-import wave
 
 import onnx_asr
 import pyaudio
@@ -29,6 +26,21 @@ except (ImportError, ValueError) as e:
     HAS_APPINDICATOR = False
     print(f"Warning: AppIndicator not available ({e}), tray icon will not be shown")
 
+# Import audio recording components
+from audio_recorder import (
+    AudioConfig,
+    AudioDeviceInfo,
+    RecordingResult,
+    detect_audio_device,
+    detect_supported_rate,
+    save_audio_to_wav,
+    resample_audio,
+    StandardRecorder,
+    suppress_stderr,
+    RAW_RECORDING_PATH,
+    PROCESSED_RECORDING_PATH,
+)
+
 # Import streaming components
 try:
     from streaming_recorder import StreamingRecorder
@@ -37,50 +49,6 @@ try:
 except ImportError as e:
     HAS_STREAMING = False
     print(f"Warning: Streaming components not available ({e})")
-
-
-@contextlib.contextmanager
-def suppress_stderr():
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    old_stderr = os.dup(2)
-    sys.stderr.flush()
-    os.dup2(devnull, 2)
-    os.close(devnull)
-    try:
-        yield
-    finally:
-        os.dup2(old_stderr, 2)
-        os.close(old_stderr)
-
-
-def create_icon_file(state="idle"):
-    """Create a colored icon file for the tray based on state.
-
-    Args:
-        state: One of "idle", "recording", or "transcribing"
-    """
-    from PIL import Image, ImageDraw
-    import os
-
-    colors = {
-        "idle": (100, 100, 100),       # Gray
-        "recording": (255, 0, 0),       # Bright Red
-        "transcribing": (0, 120, 255)   # Bright Blue
-    }
-
-    color = colors.get(state, colors["idle"])
-
-    icon_dir = os.path.expanduser("~/AUR/asr-hotkey/icons")
-    os.makedirs(icon_dir, exist_ok=True)
-
-    icon_path = os.path.join(icon_dir, f"parakeet-{state}.png")
-
-    img = Image.new('RGBA', (48, 48), color=(0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.ellipse([8, 8, 40, 40], fill=color)
-    img.save(icon_path, 'PNG')
-
-    return icon_path
 
 
 class ServiceState(enum.Enum):
@@ -162,69 +130,52 @@ class TranscriptionSession:
                 pass
 
     def _run_standard(self) -> None:
-        # Blockingly record using a dedicated thread loop to avoid callback races
-        pa = self._service.p
-        fmt = self._service.FORMAT
-        channels = self._service.CHANNELS
-        rate = self._service.supported_rate
-        chunk = self._service.CHUNK
-
-        stream = None
+        # Use StandardRecorder for clean, functional recording
+        recorder = StandardRecorder(self._service.audio_config, self._service.p)
+        
         try:
-            stream = pa.open(
-                format=fmt,
-                channels=channels,
-                rate=rate,
-                input=True,
-                frames_per_buffer=chunk,
-            )
+            recorder.start_recording()
             while not self._stop_event.is_set():
-                data = stream.read(chunk, exception_on_overflow=False)
-                self._frames.append(data)
-        finally:
-            if stream is not None:
-                try:
-                    stream.stop_stream()
-                    stream.close()
-                except Exception as e:
-                    print(f"Warning: error closing stream: {e}")
-
-        # Processing phase
-        if not self._frames or len(self._frames) < 5:
+                recorder.read_chunk()
+        except Exception as e:
+            print(f"Recording error: {e}")
+            self._service._on_session_state_change(ServiceState.IDLE)
+            return
+        
+        # Stop and get result
+        recording_result = recorder.stop_recording()
+        
+        # Validate recording
+        if not recording_result or recording_result.frame_count < 5:
             print("Recording too short, ignoring...")
             self._service._on_session_state_change(ServiceState.IDLE)
             return
 
         self._service._on_session_state_change(ServiceState.PROCESSING)
 
-        audio_data = b"".join(self._frames)
         # Save raw recording
-        wf = wave.open(self._service.RAW_FILE, 'wb')
-        wf.setnchannels(channels)
-        wf.setsampwidth(pa.get_sample_size(fmt))
-        wf.setframerate(rate)
-        wf.writeframes(audio_data)
-        wf.close()
+        try:
+            save_audio_to_wav(recording_result, RAW_RECORDING_PATH, self._service.p)
+        except Exception as e:
+            print(f"Error saving audio: {e}")
+            self._service._on_session_state_change(ServiceState.IDLE)
+            return
 
         # Resample if needed
-        if rate != self._service.MODEL_RATE:
+        if recording_result.sample_rate != self._service.audio_config.model_rate:
             try:
-                subprocess.run(
-                    ['ffmpeg', '-y', '-i', self._service.RAW_FILE, '-ar', str(self._service.MODEL_RATE), self._service.TEMP_FILE],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True
-                )
+                resample_audio(RAW_RECORDING_PATH, PROCESSED_RECORDING_PATH, self._service.audio_config.model_rate)
             except Exception as e:
                 print(f"Error during resampling: {e}")
                 self._service._on_session_state_change(ServiceState.IDLE)
                 return
         else:
-            shutil.copy(self._service.RAW_FILE, self._service.TEMP_FILE)
+            import shutil
+            shutil.copy(RAW_RECORDING_PATH, PROCESSED_RECORDING_PATH)
 
         # Recognize
         print("Transcribing...")
-        result = self._service.model.recognize(self._service.TEMP_FILE)
+        result = self._service.model.recognize(PROCESSED_RECORDING_PATH)
         result = result.strip() if result else ""
         self._service._on_session_final(result, self.mode)
 
@@ -232,8 +183,7 @@ class TranscriptionSession:
         # Initialize streaming helpers
         self._streaming_recorder = StreamingRecorder(
             audio_instance=self._service.p,
-            sample_rate=self._service.MODEL_RATE,
-            channels=self._service.CHANNELS,
+            config=self._service.audio_config,
             window_seconds=self.window_seconds,
             slide_seconds=self.slide_seconds,
             start_delay_seconds=self.start_delay_seconds,
@@ -306,30 +256,45 @@ class ParakeetService:
     """
 
     def __init__(self, streaming_mode=False, window_seconds=7.0, slide_seconds=3.0, start_delay_seconds=6.0):
-        print("Loading model... This may take a few seconds...")
+        print("[INIT] ParakeetService initialization started")
+        print("[MODEL] Loading model... This may take a few seconds...")
         
         # Check available ONNX Runtime providers
         import onnxruntime as rt
         available_providers = rt.get_available_providers()
-        print(f"Available ONNX Runtime providers: {available_providers}")
+        print(f"[MODEL] Available ONNX Runtime providers: {available_providers}")
         
         # Prioritize GPU (CUDA) over CPU for inference
-        self.model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v2", providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        print("Model loaded!")
+        model_name = "nemo-parakeet-tdt-0.6b-v2"
+        print(f"[MODEL] Loading model '{model_name}' with providers: {available_providers}")
+        print("[MODEL] This is the blocking call - please wait...")
         
-        # Verify which provider is being used
-        if 'CUDAExecutionProvider' in available_providers:
-            print("✓ GPU (CUDA) acceleration enabled")
-        else:
-            print("⚠ Warning: CUDA not available, falling back to CPU")
-
-        # Audio settings
-        self.CHUNK = 2048
-        self.FORMAT = pyaudio.paInt16
-        self.CHANNELS = 1
-        self.MODEL_RATE = 16000
-        self.TEMP_FILE = "/tmp/parakeet_recording.wav"
-        self.RAW_FILE = "/tmp/parakeet_recording_raw.wav"
+        try:
+            self.model = onnx_asr.load_model(model_name, providers=available_providers)
+            print("[MODEL] ✓ Model loaded successfully!")
+            
+            # Check which provider is actually being used by the loaded model
+            # The onnx_asr model wraps an ONNX Runtime session
+            if hasattr(self.model, 'session'):
+                actual_providers = self.model.session.get_providers()
+                print(f"[MODEL] Providers list (priority order): {actual_providers}")
+                if actual_providers:
+                    active_provider = actual_providers[0]
+                    print(f"[MODEL] ✓ Active provider: {active_provider}")
+                    if 'CPU' not in active_provider:
+                        print(f"[MODEL] ✓ GPU acceleration is ACTIVE")
+                    else:
+                        print(f"[MODEL] ⚠ Running on CPU (no GPU acceleration)")
+            else:
+                # Fallback: try to inspect the model object
+                print(f"[MODEL] Model type: {type(self.model)}")
+                print(f"[MODEL] Model attributes: {dir(self.model)}")
+                
+        except Exception as e:
+            print(f"[MODEL] ✗ ERROR loading model: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
         # Core state
         self._lock = threading.RLock()
@@ -339,8 +304,42 @@ class ParakeetService:
         # UI
         self.tray_icon = None
 
+        # Initialize PyAudio
         with suppress_stderr():
             self.p = pyaudio.PyAudio()
+
+        # Detect and log input device information
+        try:
+            device_info = detect_audio_device(self.p)
+            print(f"Using input device: {device_info.name} (index: {device_info.index})")
+        except Exception as e:
+            print(f"Warning: Could not get input device info: {e}")
+
+        # Create initial audio config with defaults
+        base_config = AudioConfig(
+            chunk_size=2048,
+            format=pyaudio.paInt16,
+            channels=1,
+            model_rate=16000,
+        )
+
+        # Detect supported sample rate
+        print("Detecting supported sample rate...")
+        try:
+            supported_rate = detect_supported_rate(self.p, base_config)
+            print(f"Using sample rate: {supported_rate} Hz")
+        except RuntimeError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+        # Create final audio config with detected rate
+        self.audio_config = AudioConfig(
+            chunk_size=base_config.chunk_size,
+            format=base_config.format,
+            channels=base_config.channels,
+            model_rate=base_config.model_rate,
+            supported_rate=supported_rate,
+        )
 
         # Streaming configuration
         self.streaming_mode = bool(streaming_mode and HAS_STREAMING)
@@ -350,39 +349,22 @@ class ParakeetService:
         if streaming_mode and not HAS_STREAMING:
             print("Warning: Streaming mode requested but components not available, falling back to standard mode")
 
-        # Detect usable input rate once
-        print("Detecting supported sample rate...")
-        self.supported_rate = None
-        for test_rate in [48000, 44100, 32000, 22050, 16000, 8000]:
-            try:
-                with suppress_stderr():
-                    s = self.p.open(
-                        format=self.FORMAT,
-                        channels=self.CHANNELS,
-                        rate=test_rate,
-                        input=True,
-                        frames_per_buffer=self.CHUNK,
-                    )
-                    s.close()
-                self.supported_rate = test_rate
-                print(f"Using sample rate: {self.supported_rate} Hz")
-                break
-            except Exception:
-                continue
-        if not self.supported_rate:
-            print("Error: Could not find supported sample rate")
-            sys.exit(1)
-
         # Initialize system tray
+        print("[INIT] Initializing system tray...")
         self._setup_tray()
+        print(f"[INIT] Tray setup complete. Tray icon object: {self.tray_icon}")
 
     def _setup_tray(self):
         """Setup system tray icon."""
+        print("[TRAY] _setup_tray() called")
+        print(f"[TRAY] HAS_APPINDICATOR = {HAS_APPINDICATOR}")
         if not HAS_APPINDICATOR:
+            print("[TRAY] AppIndicator not available, skipping tray icon")
             self.tray_icon = None
             return
 
         try:
+            print("[TRAY] Creating menu...")
             menu = Gtk.Menu()
             toggle_item = Gtk.MenuItem(label="Toggle Recording")
             toggle_item.connect("activate", lambda _: self._tray_toggle())
@@ -390,28 +372,46 @@ class ParakeetService:
             menu.append(Gtk.SeparatorMenuItem())
             quit_item = Gtk.MenuItem(label="Quit")
             quit_item.connect("activate", lambda _: self._tray_quit())
-            menu.append(quit_item)
             menu.show_all()
+            print("[TRAY] Menu created successfully")
 
             icon_path = os.path.expanduser("~/AUR/asr-hotkey/icons")
-            create_icon_file("idle")
-            create_icon_file("recording")
-            create_icon_file("transcribing")
+            print(f"[TRAY] Icon path: {icon_path}")
+            print(f"[TRAY] Icon path exists: {os.path.exists(icon_path)}")
+            if os.path.exists(icon_path):
+                print(f"[TRAY] Icon path contents: {os.listdir(icon_path)}")
 
+            print("[TRAY] Creating AppIndicator...")
             self.tray_icon = AppIndicator.Indicator.new(
                 "parakeet",
                 "parakeet-idle",
                 AppIndicator.IndicatorCategory.APPLICATION_STATUS,
             )
+            print("[TRAY] AppIndicator created")
+            
+            print("[TRAY] Setting icon theme path...")
             self.tray_icon.set_icon_theme_path(icon_path)
+            print("[TRAY] Setting attention icon...")
             self.tray_icon.set_attention_icon("parakeet-transcribing")
+            print("[TRAY] Setting status to ACTIVE...")
             self.tray_icon.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+            print("[TRAY] Setting menu...")
             self.tray_icon.set_menu(menu)
+            print("[TRAY] Setting title...")
             self.tray_icon.set_title("Parakeet (Idle)")
-            print("System tray icon initialized")
+            
+            # Verify the indicator is properly set up
+            print(f"[TRAY] Verification:")
+            print(f"  Status: {self.tray_icon.get_status()}")
+            print(f"  Icon name: {self.tray_icon.get_icon()}")
+            print(f"  Menu: {self.tray_icon.get_menu()}")
+            print("[TRAY] ✓ System tray icon initialized successfully")
         except Exception as e:
-            print(f"Warning: Could not create system tray icon: {e}")
-            print("Continuing without tray icon...")
+            print(f"[TRAY] ✗ ERROR: Could not create system tray icon: {e}")
+            import traceback
+            print(f"[TRAY] Stack trace:")
+            traceback.print_exc()
+            print("[TRAY] Continuing without tray icon...")
             self.tray_icon = None
 
     def _tray_toggle(self):
@@ -539,11 +539,11 @@ class ParakeetService:
             # Format the prompt
             prompt = f"""Answer the following question or instruction concisely and directly. Output ONLY the answer and NOTHING ELSE. No explanations, no preamble, no postamble.
 
-If asking for a command, provide only the command.
-If asking for a translation, provide only the translated word/phrase.
-If asking for information, provide a brief 1-2 sentence answer.
+            If asking for a command, provide only the command.
+            If asking for a translation, provide only the translated word/phrase.
+            If asking for information, provide a brief 1-2 sentence answer.
 
-Question/Instruction: {question}"""
+            Question/Instruction: {question}"""
 
             # Prepare API request
             url = "https://openrouter.ai/api/v1/chat/completions"
@@ -635,10 +635,10 @@ Question/Instruction: {question}"""
             # Format the prompt
             prompt = f"""You will receive an instruction and a text. Apply the instruction to the text or answer the question asked about the text, give short and concise answers in 1 - 2 sentences. Output ONLY the transformed text OR your answer and NOTHING ELSE. No explanations, no preamble, no postamble.
 
-Instruction: {instruction}
+            Instruction: {instruction}
 
-Text:
-{clipboard_text}"""
+            Text:
+            {clipboard_text}"""
 
             # Prepare API request
             url = "https://openrouter.ai/api/v1/chat/completions"
@@ -729,16 +729,16 @@ Text:
 
             # Format the prompt
             prompt = f"""I'm giving you a short piece of text, as well as another short text that should be inserted into the first text. If you find an underline with spaces around in the text, the insertion should go there, if not, the insertion should go at the end of the text. Make the insertion fit into the text or at the end. Especially regarding punctuation marks and capitalization, you can also make small changes to words around the insertion to make it fit better, but only if necessary, keep the first text as close to the original as possible.
-The insertion is a transcript that is machine created and might contain words that were misunderstood. Sometimes there are specialized terms that can be corrected with the context from the rest of the text, check the existing text closely for names or specialized terms that could be wrong in the transcript. Fix that and repair other obvious artifacts of the transcription but keep as close to the original as possible.
-Keep the overall tone academic, exclamation marks are unusual. Output only the final text and NOTHING ELSE.
+            The insertion is a transcript that is machine created and might contain words that were misunderstood. Sometimes there are specialized terms that can be corrected with the context from the rest of the text, check the existing text closely for names or specialized terms that could be wrong in the transcript. Fix that and repair other obvious artifacts of the transcription but keep as close to the original as possible.
+            Keep the overall tone academic, exclamation marks are unusual. Output only the final text and NOTHING ELSE.
 
-<text>
-{existing_text}
-</text>
+            <text>
+            {existing_text}
+            </text>
 
-<insertion>
-{transcription}
-</insertion>"""
+            <insertion>
+            {transcription}
+            </insertion>"""
 
             # Prepare API request
             url = "https://openrouter.ai/api/v1/chat/completions"
@@ -853,6 +853,17 @@ Keep the overall tone academic, exclamation marks are unusual. Output only the f
                 self.StartRecordingAsk()
 
 if __name__ == '__main__':
+    print("="*60)
+    print("[MAIN] Parakeet D-Bus service starting...")
+    print("="*60)
+    
+    # Debug environment
+    print("[ENV] Environment diagnostics:")
+    print(f"  DISPLAY: {os.environ.get('DISPLAY', 'NOT SET')}")
+    print(f"  WAYLAND_DISPLAY: {os.environ.get('WAYLAND_DISPLAY', 'NOT SET')}")
+    print(f"  XDG_RUNTIME_DIR: {os.environ.get('XDG_RUNTIME_DIR', 'NOT SET')}")
+    print(f"  GTK version: {Gtk.get_major_version()}.{Gtk.get_minor_version()}.{Gtk.get_micro_version()}")
+    print(f"  GLib version: {GLib.MAJOR_VERSION}.{GLib.MINOR_VERSION}.{GLib.MICRO_VERSION}")
     parser = argparse.ArgumentParser(
         description='Parakeet D-Bus transcription service',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -880,22 +891,32 @@ Streaming Mode:
     parser.add_argument('--delay', type=float, default=6.0, help='Delay before starting streaming in seconds (default: 6.0)')
 
     args = parser.parse_args()
+    print(f"[MAIN] Arguments: stream={args.stream}, window={args.window}, slide={args.slide}, delay={args.delay}")
 
-    print("Starting Parakeet D-Bus service...")
+    print("[MAIN] Creating SessionBus...")
     bus = SessionBus()
+    print("[MAIN] SessionBus created")
+    
+    print("[MAIN] Creating ParakeetService...")
     service = ParakeetService(
         streaming_mode=args.stream,
         window_seconds=args.window,
         slide_seconds=args.slide,
         start_delay_seconds=args.delay,
     )
+    print("[MAIN] ParakeetService created")
 
+    print("[MAIN] Publishing D-Bus service...")
     bus.publish("com.parakeet.Transcribe", service)
-    print("D-Bus service published at com.parakeet.Transcribe")
-    print("Ready!")
+    print("[MAIN] ✓ D-Bus service published at com.parakeet.Transcribe")
+    print("="*60)
+    print("[MAIN] ✓ Ready! Service is running.")
+    print("="*60)
 
+    print("[MAIN] Starting GLib.MainLoop...")
     loop = GLib.MainLoop()
     try:
         loop.run()
     except KeyboardInterrupt:
-        print("\nExiting...")
+        print("\n[MAIN] Keyboard interrupt received")
+        print("[MAIN] Exiting...")
